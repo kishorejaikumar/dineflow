@@ -64,6 +64,45 @@ const tomorrow = (h) => { const d = new Date(); d.setDate(d.getDate() + 5); d.se
   r = await call('POST', '/reservations', vik, { tableId: t.table_id, partySize: 2, start: new Date(new Date(slot).getTime() + 30 * 60000).toISOString(), minutes: 60 });
   ok('overlapping reservation blocked by the database (409)', r.s === 409 && /already booked/.test(r.j.error));
 
+  // ---- session limits (defaults: customer 60 min, staff 30 min) ----
+  const mins = (x) => (x - Date.now() / 1000) / 60;
+  r = await call('POST', '/auth/login', null, { email: 'vikram.shah@example.in', password: 'Customer@123' });
+  ok('customer session lasts about 60 minutes (expiresAt in the login reply)', Math.abs(mins(r.j.expiresAt) - 60) < 2);
+  r = await call('POST', '/auth/staff-login', null, { email: 'kitchen1@dineflow.in', password: 'Kitchen@123' });
+  ok('staff session lasts about 30 minutes', Math.abs(mins(r.j.expiresAt) - 30) < 2);
+  r = await call('GET', '/auth/me', me); ok('/auth/me returns the expiry time', r.s === 200 && r.j.expiresAt > Date.now() / 1000);
+
+  // ---- reservation rules through the API ----
+  const at = (days, h) => { const d = new Date(); d.setDate(d.getDate() + days); d.setHours(h, 0, 0, 0); return d.toISOString(); };
+  r = await call('GET', '/tables', me); const tt = r.j.tables || [];
+  ok('table list is flagged for the customer: T05 is reserved by another guest and cannot be chosen', r.s === 200 && tt.find((x) => x.no === 'T05') && tt.find((x) => x.no === 'T05').state === 'reserved' && tt.find((x) => x.no === 'T01').state === 'free');
+  r = await call('GET', `/tables/available?start=${encodeURIComponent(slot)}&party=2&minutes=90`);
+  const other = r.j.tables.find((x) => x.table_id !== t.table_id);
+  r = await call('POST', '/reservations', me, { tableId: other.table_id, partySize: 2, start: new Date(new Date(slot).getTime() + 15 * 60000).toISOString(), minutes: 60 });
+  ok('the same customer cannot hold two bookings at the same time (409)', r.s === 409 && /already have a booking/.test(r.j.error));
+  const b2 = await call('POST', '/reservations', me, { tableId: t.table_id, partySize: 2, start: at(6, 19), minutes: 60 });
+  const b3 = await call('POST', '/reservations', me, { tableId: t.table_id, partySize: 2, start: at(7, 19), minutes: 60 });
+  const b4 = await call('POST', '/reservations', me, { tableId: t.table_id, partySize: 2, start: at(8, 19), minutes: 60 });
+  ok('a customer can hold at most 3 upcoming bookings: 2nd and 3rd accepted, 4th rejected (409)', b2.s === 201 && b3.s === 201 && b4.s === 409 && /3 upcoming/.test(b4.j.error));
+  r = await call('POST', `/reservations/${b3.j.reservationId}/cancel`, me); const b5 = await call('POST', '/reservations', me, { tableId: t.table_id, partySize: 2, start: at(8, 19), minutes: 60 });
+  ok('cancelling a booking frees a place: the next booking is accepted (201)', r.s === 200 && b5.s === 201);
+
+  // ---- admin menu management ----
+  const stamp = Date.now() % 100000;
+  r = await call('POST', '/admin/categories', me, { name: 'Hack ' + stamp }); ok('a customer cannot add a category (403)', r.s === 403);
+  r = await call('POST', '/admin/menu', chef, { categoryId: 1, name: 'Chef Dish', price: 10, stock: 1 }); ok('kitchen staff cannot add a dish (403)', r.s === 403);
+  r = await call('POST', '/admin/categories', adm, { name: 'Soups ' + stamp }); const catId = r.j.id; ok('admin adds a category (201)', r.s === 201 && !!catId);
+  r = await call('POST', '/admin/categories', adm, { name: 'Soups ' + stamp }); ok('a duplicate category is rejected (409)', r.s === 409 && /already exists/.test(r.j.error));
+  r = await call('POST', '/admin/menu', adm, { categoryId: catId, name: 'Tomato Soup ' + stamp, price: 120, veg: true, stock: 25, description: 'Hot tomato soup' }); const dishId = r.j.id;
+  ok('admin adds a dish with opening stock (201)', r.s === 201 && !!dishId);
+  r = await call('GET', '/menu'); const nd = (r.j.items || []).find((x) => x.id === dishId);
+  ok('the new dish appears on the customer menu with its price and stock', nd && nd.price === 120 && nd.stock === 25 && nd.category === 'Soups ' + stamp);
+  r = await call('POST', '/admin/menu', adm, { categoryId: catId, name: 'Tomato Soup ' + stamp, price: 120, stock: 5 }); ok('a duplicate dish name is rejected (409)', r.s === 409 && /already exists/.test(r.j.error));
+  r = await call('POST', '/admin/menu', adm, { categoryId: catId, name: 'Free Soup ' + stamp, price: 0, stock: 5 }); ok('a dish with price 0 is rejected (409)', r.s === 409);
+  r = await call('POST', `/admin/menu/${dishId}/active`, adm, { active: false }); const hidden = await call('GET', '/menu'); const am = await call('GET', '/admin/menu', adm);
+  ok('hiding a dish removes it from the customer menu but not from the admin list', r.s === 200 && !(hidden.j.items || []).some((x) => x.id === dishId) && am.j.items.some((x) => x.id === dishId && x.active === false));
+  r = await call('POST', '/orders', me, { orderType: 'Takeaway', items: [{ itemId: dishId, qty: 1 }] }); ok('a hidden dish cannot be ordered (409)', r.s === 409 && /not available/.test(r.j.error));
+
   // concurrency (Unit IV): the last Rasmalai (stock 1) from two customers at once
   const [a, b] = await Promise.all([
     call('POST', '/orders', me,  { orderType: 'Takeaway', items: [{ itemId: id('Rasmalai'), qty: 1 }] }),

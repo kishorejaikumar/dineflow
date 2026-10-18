@@ -77,13 +77,13 @@ GRANT SELECT (customer_id, full_name, email, phone, is_active, created_at) ON cu
 GRANT INSERT ON reviews TO df_customer;
 GRANT UPDATE (status) ON table_reservations TO df_customer;                                                 -- cancel own booking
 SELECT pg_temp.grant_exec('df_customer', ARRAY['fn_ctx_role','fn_ctx_user','fn_place_order','fn_cancel_order','fn_pay_order','fn_split_bill',
-  'fn_pay_split','fn_check_coupon','fn_coupon_discount','fn_reserve_table','fn_available_tables','fn_free_tables']);
+  'fn_pay_split','fn_check_coupon','fn_coupon_discount','fn_reserve_table','fn_available_tables','fn_free_tables','fn_tables_for_customer','fn_expire_reservations']);
 
 -- kitchen: sees order status and table, never money or customers
 GRANT SELECT (order_id, order_no, table_id, order_type, status, created_at, updated_at, notes) ON orders TO df_kitchen;
 GRANT UPDATE (status) ON orders TO df_kitchen;
 GRANT SELECT ON v_kitchen_queue, v_floor_map TO df_kitchen;
-SELECT pg_temp.grant_exec('df_kitchen', ARRAY['fn_ctx_role','fn_ctx_user']);
+SELECT pg_temp.grant_exec('df_kitchen', ARRAY['fn_ctx_role','fn_ctx_user','fn_expire_reservations']);
 
 -- admin: everything, except password hashes
 GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA dineflow TO df_admin;
@@ -232,6 +232,20 @@ BEGIN
     names := names || 'RLS is switched on for the 8 data tables'::text;
     oks := oks || ((SELECT COUNT(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
                      WHERE n.nspname = 'dineflow' AND c.relrowsecurity) = 8);
+
+    names := names || 'GRANT: customer role cannot run the add-dish function'::text;
+    v_ok := FALSE; BEGIN EXECUTE 'SET LOCAL ROLE df_customer'; PERFORM fn_add_menu_item(1, 'Hacked Dish', 1, TRUE, 1); EXCEPTION WHEN insufficient_privilege THEN v_ok := TRUE; END; EXECUTE 'RESET ROLE';
+    oks := oks || v_ok;
+
+    names := names || 'GRANT: kitchen role cannot run the add-dish function'::text;
+    v_ok := FALSE; BEGIN EXECUTE 'SET LOCAL ROLE df_kitchen'; PERFORM fn_add_menu_item(1, 'Hacked Dish', 1, TRUE, 1); EXCEPTION WHEN insufficient_privilege THEN v_ok := TRUE; END; EXECUTE 'RESET ROLE';
+    oks := oks || v_ok;
+
+    names := names || 'Admin role can add a dish through the function'::text;
+    PERFORM set_config('dineflow.role', 'admin', true);
+    EXECUTE 'SET LOCAL ROLE df_admin'; v_o := fn_add_menu_item(1, 'Security Test Dish', 99, TRUE, 5); EXECUTE 'RESET ROLE';
+    PERFORM set_config('dineflow.role', '', true);
+    oks := oks || (v_o IS NOT NULL AND EXISTS (SELECT 1 FROM menu_items WHERE name = 'Security Test Dish'));
 
     RAISE EXCEPTION 'rollback tests' USING ERRCODE = 'RB001';
   EXCEPTION WHEN SQLSTATE 'RB001' THEN NULL;

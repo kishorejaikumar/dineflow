@@ -4,9 +4,11 @@
 Customers register, browse the menu, reserve tables, place dine-in or takeaway orders, apply coupons, pay by UPI/card/cash, split bills, track status and rate dishes. Kitchen staff run a live display; the admin manages orders, stock, prices and reports.
 **The focus is the database.** The rules live in PostgreSQL (constraints, triggers, functions, procedures, one transaction per order); the website only exposes them.
 
-Verified on PostgreSQL 16 and Node 22: all SQL files run in order without errors, `fn_run_tests()` passes **52 of 52**, `fn_run_security_tests()` passes **20 of 20**, and `server/test/api.test.js` passes **46 of 46** (including two real concurrency races through HTTP).
+Verified on PostgreSQL 16 and Node 22: all SQL files run in order without errors, `fn_run_tests()` passes **65 of 65**, `fn_run_security_tests()` passes **23 of 23**, `server/test/api.test.js` passes **63 of 63** and `server/test/auth.test.js` (session tokens) passes **10 of 10** (including two real concurrency races through HTTP).
 
-**New in this version:** (1) row-level security, (2) database roles with GRANT/REVOKE (the API runs every request as `df_anon`, `df_customer`, `df_kitchen` or `df_admin`), (3) backup and restore script, (4) live floor map for kitchen and admin.
+**New in this version:** session limits (customer 60 min, staff 30 min, 15 idle minutes in the browser), admin can add categories and dishes and hide or show dishes from the website, and complete reservation rules (see below).
+
+**Earlier additions:** (1) row-level security, (2) database roles with GRANT/REVOKE (the API runs every request as `df_anon`, `df_customer`, `df_kitchen` or `df_admin`), (3) backup and restore script, (4) live floor map for kitchen and admin.
 
 ## Folder map (syllabus coverage)
 | File | Unit | What it shows |
@@ -17,8 +19,8 @@ Verified on PostgreSQL 16 and Node 22: all SQL files run in order without errors
 | `db/04_transactions.sql` + `04b_demo.sql` | IV | `fn_place_order` (one ACID tx, lock order, deadlock-safe), savepoints, isolation levels, two-session demos |
 | `db/05_optimization.sql` + `05b_benchmark.sql` | V | 50,000-row loader, EXPLAIN vs EXPLAIN ANALYZE, composite and partial indexes, join-method comparison |
 | `db/06_seed_data.sql` | all | realistic Indian menu, customers, coupons, 12 orders created through the real triggers |
-| `db/07_tests.sql` | all | `fn_run_tests()`: 52 checks, everything rolled back |
-| `db/08_security.sql` | security | roles, GRANT/REVOKE, row-level security, SECURITY DEFINER routines, `fn_run_security_tests()` (20 checks) |
+| `db/07_tests.sql` | all | `fn_run_tests()`: 65 checks, everything rolled back |
+| `db/08_security.sql` | security | roles, GRANT/REVOKE, row-level security, SECURITY DEFINER routines, `fn_run_security_tests()` (23 checks) |
 | `db/backup_restore.sh` | recovery | `pg_dump`/`pg_restore` backup, restore, row-count verify and a disaster demo |
 | `docs/relational_algebra.md`, `docs/diagrams.md` | III | algebra/calculus examples; Mermaid ER, architecture and status diagrams |
 | `nosql/orders_mongo.js` | V | MongoDB document model and SQL-vs-NoSQL comparison |
@@ -63,3 +65,25 @@ export RESTORE_URL=postgres://...dineflow_restore     # an EMPTY scratch databas
 ./db/backup_restore.sh demo      # backup, restore, delete all orders on the copy, restore again, verify row counts
 ```
 `backup`, `restore FILE` and `verify` can also be run on their own. Supabase also keeps daily backups; use its *direct* connection string for `pg_dump`.
+
+## Troubleshooting: a page does not work (for example Floor map or Reserve a table)
+1. Run the setup checker on the database your website uses: `psql "$DATABASE_URL" -f db/check_setup.sql` (or paste it into the Supabase SQL editor). Every row must be `t` (true). A `f` row tells you which file to run.
+2. The most common causes are an older database: `03_sql_programming.sql` was not re-run after it gained `v_floor_map`, or `08_security.sql` was not run afterwards. Fix: run `03`, `04` (optional), then `08`, in that order, as the same user that `DATABASE_URL` uses.
+3. If the page only says "Server error", set `DEBUG_ERRORS=on` in `server/.env` (or in the Render environment), restart, and reload the page: it then shows the real database error. Set it back to `off` afterwards.
+4. Open the browser console (F12) and the server log; copy the first red error message.
+
+## Session limits
+- Customers stay signed in for **60 minutes**, staff (kitchen and admin) for **30 minutes**. The top bar shows the minutes left.
+- Change them in `server/.env`: `SESSION_MINUTES_CUSTOMER=60` and `SESSION_MINUTES_STAFF=30`, then restart. The limit is absolute and enforced by the server (an expired token is refused with 401).
+- The browser also signs a user out after **15 minutes without a click or key press** (`IDLE_MIN` in `public/app.js`) and warns one minute before.
+- Wrong passwords: 5 failures per 15 minutes per email and address.
+
+## Admin menu management
+Admin, Stock & prices: **Add a new dish** (name, category, price, veg or non-veg, opening stock, description), **Add category**, and a **Hide / Show** button for every dish. Hidden dishes disappear from the customer menu and cannot be ordered, but keep their history (dishes with orders are hidden, never deleted).
+
+## Reservation rules
+- A booking must start **at least 10 minutes** from now and **at most 30 days** ahead; it lasts at most 3 hours.
+- No two live bookings may overlap on one table (exclusion constraint), and one customer may not hold two bookings at the same time.
+- A customer may hold **3 upcoming** bookings; cancelling one frees a place.
+- When the guest orders on a table they booked (from 30 minutes before the start), the booking becomes **Seated** automatically and is linked to the order. Another guest cannot order on a table reserved within the next 90 minutes; the table list shows it greyed out as "reserved".
+- Old bookings are cleaned up automatically: **No-show** 15 minutes after the end if no one came, **Completed** when the order is paid or cancelled.

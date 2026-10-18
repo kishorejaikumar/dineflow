@@ -332,14 +332,21 @@ CREATE TRIGGER trg_reviews_guard BEFORE INSERT ON reviews
 --      The EXCLUDE constraint (01) is the real guard; these add friendly rules and messages.
 -- ---------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION fn_reservation_guard() RETURNS trigger LANGUAGE plpgsql AS $$
-DECLARE v_cap SMALLINT; v_active BOOLEAN;
+DECLARE v_cap SMALLINT; v_active BOOLEAN; v_n INT;
 BEGIN
   SELECT capacity, is_active INTO v_cap, v_active FROM restaurant_tables WHERE table_id = NEW.table_id;
   IF NOT FOUND THEN RETURN NEW; END IF;                        -- the foreign key reports it
   IF NOT v_active THEN RAISE EXCEPTION 'This table is out of service'; END IF;
   IF NEW.party_size > v_cap THEN RAISE EXCEPTION 'A party of % does not fit this table (seats %)', NEW.party_size, v_cap; END IF;
-  IF TG_OP = 'INSERT' AND NEW.status = 'Booked' AND NEW.start_time < now() THEN
-    RAISE EXCEPTION 'A reservation must start in the future';
+  IF TG_OP = 'INSERT' AND NEW.status = 'Booked' THEN
+    IF NEW.start_time < now() + interval '10 minutes' THEN RAISE EXCEPTION 'A reservation must start at least 10 minutes from now'; END IF;
+    IF NEW.start_time > now() + interval '30 days' THEN RAISE EXCEPTION 'Reservations can be made at most 30 days ahead'; END IF;
+    SELECT COUNT(*) INTO v_n FROM table_reservations WHERE customer_id = NEW.customer_id AND status = 'Booked' AND end_time > now();
+    IF v_n >= 3 THEN RAISE EXCEPTION 'You already have 3 upcoming reservations. Cancel one before booking another.'; END IF;
+    IF EXISTS (SELECT 1 FROM table_reservations WHERE customer_id = NEW.customer_id AND status IN ('Booked','Seated')
+                  AND tstzrange(start_time, end_time) && tstzrange(NEW.start_time, NEW.end_time)) THEN
+      RAISE EXCEPTION 'You already have a booking at that time';
+    END IF;
   END IF;
   RETURN NEW;
 END $$;
@@ -351,6 +358,7 @@ CREATE OR REPLACE FUNCTION fn_reserve_table(p_customer INT, p_table INT, p_party
 RETURNS INT LANGUAGE plpgsql AS $$
 DECLARE v_id INT;
 BEGIN
+  PERFORM fn_expire_reservations();
   INSERT INTO table_reservations (customer_id, table_id, party_size, start_time, end_time)
   VALUES (p_customer, p_table, p_party, p_start, p_start + make_interval(mins => p_minutes))
   RETURNING reservation_id INTO v_id;
@@ -582,6 +590,92 @@ EXCEPTION WHEN OTHERS THEN
   RAISE EXCEPTION 'Settlement for % failed: %', p_date, SQLERRM;
 END $$;
 
+
+
+-- ---------------------------------------------------------------------
+-- 2.15  Reservation life cycle and table choice for a customer
+--       fn_expire_reservations : Booked 15 minutes after its end with no order -> No-show;
+--                                Seated whose order is Paid or Cancelled -> Completed.
+--                                (Called lazily by the API and by fn_reserve_table, so no scheduler is needed.)
+--       fn_tables_for_customer : tables without a live order, each flagged for THIS customer:
+--                                'mine' (their own booking is usable now), 'reserved' (another guest booked it
+--                                within 90 minutes) or 'free'.
+-- ---------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION fn_expire_reservations() RETURNS INT LANGUAGE plpgsql AS $$
+DECLARE v_n INT := 0; v_k INT;
+BEGIN
+  UPDATE table_reservations SET status = 'No-show'
+   WHERE status = 'Booked' AND end_time < now() - interval '15 minutes';
+  GET DIAGNOSTICS v_k = ROW_COUNT; v_n := v_n + v_k;
+  UPDATE table_reservations r SET status = 'Completed'
+   WHERE r.status = 'Seated' AND EXISTS (SELECT 1 FROM orders o WHERE o.reservation_id = r.reservation_id AND o.status IN ('Paid','Cancelled'));
+  GET DIAGNOSTICS v_k = ROW_COUNT; v_n := v_n + v_k;
+  RETURN v_n;
+END $$;
+
+CREATE OR REPLACE FUNCTION fn_tables_for_customer(p_customer INT)
+RETURNS TABLE (table_id INT, no TEXT, capacity INT, area TEXT, state TEXT, reservation_id INT, booking_start TIMESTAMPTZ)
+LANGUAGE plpgsql AS $$
+BEGIN
+  PERFORM fn_expire_reservations();
+  RETURN QUERY
+  SELECT t.table_id, t.table_no::text, t.capacity::int, t.area::text,
+         (CASE WHEN mine.reservation_id IS NOT NULL THEN 'mine' WHEN other.reservation_id IS NOT NULL THEN 'reserved' ELSE 'free' END)::text,
+         mine.reservation_id, COALESCE(mine.start_time, other.start_time)
+    FROM restaurant_tables t
+    LEFT JOIN LATERAL (SELECT r.reservation_id, r.start_time FROM table_reservations r
+                        WHERE r.table_id = t.table_id AND r.customer_id = p_customer AND r.status = 'Booked'
+                          AND r.start_time - interval '30 minutes' <= now() AND r.end_time > now() ORDER BY r.start_time LIMIT 1) mine ON TRUE
+    LEFT JOIN LATERAL (SELECT r.reservation_id, r.start_time FROM table_reservations r
+                        WHERE r.table_id = t.table_id AND r.customer_id <> p_customer AND r.status = 'Booked'
+                          AND tstzrange(r.start_time, r.end_time) && tstzrange(now(), now() + interval '90 minutes') ORDER BY r.start_time LIMIT 1) other ON TRUE
+   WHERE t.is_active AND NOT EXISTS (SELECT 1 FROM orders o WHERE o.table_id = t.table_id AND o.status NOT IN ('Paid','Cancelled'))
+   ORDER BY t.table_no;
+END $$;
+
+-- ---------------------------------------------------------------------
+-- 2.16  Admin menu management: add a category, add a dish, hide or show a dish.
+--       Only the admin (or a psql session acting as 'system') may call them; 08_security.sql also
+--       limits EXECUTE to df_admin.  Dishes that already have orders are hidden, never deleted.
+-- ---------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION fn_add_category(p_name TEXT) RETURNS INT LANGUAGE plpgsql AS $$
+DECLARE v_id INT;
+BEGIN
+  IF fn_ctx_role() NOT IN ('admin','system') THEN RAISE EXCEPTION 'Only the administrator can change the menu'; END IF;
+  p_name := trim(p_name);
+  IF p_name IS NULL OR length(p_name) < 2 OR length(p_name) > 40 THEN RAISE EXCEPTION 'A category name needs 2 to 40 characters'; END IF;
+  INSERT INTO categories (name, display_order) VALUES (p_name, COALESCE((SELECT MAX(display_order) FROM categories), 0) + 1)
+  RETURNING category_id INTO v_id;
+  RETURN v_id;
+EXCEPTION WHEN unique_violation THEN RAISE EXCEPTION 'That category already exists';
+END $$;
+
+CREATE OR REPLACE FUNCTION fn_add_menu_item(p_category INT, p_name TEXT, p_price NUMERIC, p_veg BOOLEAN, p_stock INT,
+                                            p_description TEXT DEFAULT NULL, p_reorder INT DEFAULT 10) RETURNS INT
+LANGUAGE plpgsql AS $$
+DECLARE v_id INT;
+BEGIN
+  IF fn_ctx_role() NOT IN ('admin','system') THEN RAISE EXCEPTION 'Only the administrator can change the menu'; END IF;
+  p_name := trim(p_name);
+  IF p_name IS NULL OR length(p_name) < 2 OR length(p_name) > 80 THEN RAISE EXCEPTION 'A dish name needs 2 to 80 characters'; END IF;
+  IF p_price IS NULL OR p_price <= 0 OR p_price > 100000 THEN RAISE EXCEPTION 'The price must be above 0 and at most 100000'; END IF;
+  IF p_stock IS NULL OR p_stock < 0 OR p_stock > 100000 THEN RAISE EXCEPTION 'The opening stock must be between 0 and 100000'; END IF;
+  IF p_reorder IS NULL OR p_reorder < 0 THEN RAISE EXCEPTION 'The reorder level cannot be negative'; END IF;
+  INSERT INTO menu_items (category_id, name, description, price, is_veg, stock_qty, reorder_level)
+  VALUES (p_category, p_name, left(trim(p_description), 200), p_price, COALESCE(p_veg, TRUE), p_stock, p_reorder)
+  RETURNING item_id INTO v_id;
+  RETURN v_id;
+EXCEPTION
+  WHEN unique_violation      THEN RAISE EXCEPTION 'A dish with this name already exists';
+  WHEN foreign_key_violation THEN RAISE EXCEPTION 'Unknown category';
+END $$;
+
+CREATE OR REPLACE FUNCTION fn_set_item_active(p_item INT, p_active BOOLEAN) RETURNS VOID LANGUAGE plpgsql AS $$
+BEGIN
+  IF fn_ctx_role() NOT IN ('admin','system') THEN RAISE EXCEPTION 'Only the administrator can change the menu'; END IF;
+  UPDATE menu_items SET is_active = p_active WHERE item_id = p_item;
+  IF NOT FOUND THEN RAISE EXCEPTION 'Menu item % does not exist', p_item; END IF;
+END $$;
 
 -- ---------------------------------------------------------------------
 -- 2.14  FEATURE: live floor map. One row per active table with its state:

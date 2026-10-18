@@ -13,7 +13,7 @@ const wrap = (fn) => (req, res, next) => fn(req, res, next).catch((e) => {
     case '40001': case '40P01': status = 503; msg = 'The system was busy. Please try again.'; break;
   }
   if (!msg) { status = 500; msg = 'Server error'; }
-  if (status === 500) console.error(e);
+  if (status === 500) { console.error(e); if (process.env.DEBUG_ERRORS === 'on') msg = `Server error [${e.code || 'no code'}]: ${e.message}`; }   // DEBUG_ERRORS=on only while fixing a problem
   res.status(status).json({ error: msg });
 });
 const bad = (message, status = 400) => Object.assign(new Error(message), { status });

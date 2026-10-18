@@ -46,10 +46,18 @@ BEGIN
        WHERE reservation_id = p_reservation_id AND customer_id = p_customer AND table_id = p_table_id
          AND status = 'Booked' AND start_time - interval '30 minutes' <= now() AND end_time > now();
       IF NOT FOUND THEN RAISE EXCEPTION 'That reservation is not valid for this table right now'; END IF;
-    ELSIF EXISTS (SELECT 1 FROM table_reservations
-                   WHERE table_id = p_table_id AND status = 'Booked' AND customer_id <> p_customer
-                     AND tstzrange(start_time, end_time) && tstzrange(now(), now() + interval '90 minutes')) THEN
-      RAISE EXCEPTION 'Table % is reserved by another guest around this time', t.table_no;
+    ELSE                                                      -- no id sent: seat the guest's own usable booking automatically
+      UPDATE table_reservations SET status = 'Seated'
+       WHERE reservation_id = (SELECT reservation_id FROM table_reservations
+                                WHERE customer_id = p_customer AND table_id = p_table_id AND status = 'Booked'
+                                  AND start_time - interval '30 minutes' <= now() AND end_time > now()
+                                ORDER BY start_time LIMIT 1 FOR UPDATE)
+      RETURNING reservation_id INTO p_reservation_id;
+      IF p_reservation_id IS NULL AND EXISTS (SELECT 1 FROM table_reservations
+                     WHERE table_id = p_table_id AND status = 'Booked' AND customer_id <> p_customer
+                       AND tstzrange(start_time, end_time) && tstzrange(now(), now() + interval '90 minutes')) THEN
+        RAISE EXCEPTION 'Table % is reserved by another guest around this time', t.table_no;
+      END IF;
     END IF;
   ELSE
     p_table_id := NULL;                                       -- takeaway has no table
